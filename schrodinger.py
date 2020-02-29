@@ -4,6 +4,7 @@ General Numerical Solver for the 1D Time-Dependent Schrodinger Equation.
 Authors:
 - Jake Vanderplas <vanderplas@astro.washington.edu>
 - Andre Xuereb (imaginary time propagation, normalized wavefunction
+- Anthony Michalek (Generalized Normal, easier access to some parts)
 
 For a theoretical description of the algorithm, please see
 http://jakevdp.github.com/blog/2012/09/05/quantum-python/
@@ -20,24 +21,25 @@ class Schrodinger(object):
     Class which implements a numerical solution of the time-dependent
     Schrodinger equation for an arbitrary potential
     """
-    def __init__(self, x, psi_x0, V_x, k0=None, hbar=1, m=1, t0=0.0):
+
+    def __init__(self, x, psi_x0, V_x, p0=None, hbar=1, m=1, t0=0.0):
         """
         Parameters
         ----------
-        x : array_like, float
+        x : array_lipe, float
             Length-N array of evenly spaced spatial coordinates
         psi_x0 : array_like, complex
             Length-N array of the initial wave function at time t0
         V_x : array_like, float
             Length-N array giving the potential at each x
-        k0 : float
-            The minimum value of k.  Note that, because of the workings of the
+        p0 : float
+            The minimum value of p.  Note that, because of the workings of the
             Fast Fourier Transform, the momentum wave-number will be defined
             in the range
-              k0 < k < 2*pi / dx ,
+              p0 < p < 2*pi / dx ,
             where dx = x[1]-x[0].  If you expect nonzero momentum outside this
             range, you must modify the inputs accordingly.  If not specified,
-            k0 will be calculated such that the range is [-k0,k0]
+            p0 will be calculated such that the range is [-p0,p0]
         hbar : float
             Value of Planck's constant (default = 1)
         m : float
@@ -61,45 +63,57 @@ class Schrodinger(object):
         self.dt_ = None
         self.N = len(x)
         self.dx = self.x[1] - self.x[0]
-        self.dk = 2 * np.pi / (self.N * self.dx)
+
+        self.xmin = self.x[0]
+        self.xmax = self.x[N - 1]
+
+        self.dp = 2 * np.pi / (self.N * self.dx)
 
         # Set momentum scale
-        if k0 == None:
-            self.k0 = -0.5 * self.N * self.dk
+        if p0 is None:
+            self.p0 = -0.5 * self.N * self.dp
         else:
-            assert k0 < 0
-            self.k0 = k0
-        self.k = self.k0 + self.dk * np.arange(self.N)
+            assert p0 < 0
+            self.p0 = p0
+        self.p = self.p0 + self.dp * np.arange(self.N)
+
+        self.pmin = self.p[0]
+        self.pmax = self.p[N - 1]
 
         self.psi_x = psi_x0
-        self.compute_k_from_x()
+        self.compute_p_from_x()
+        self.psi_x0 = psi_x0 / self.wf_norm(psi_x0, self.dx)
+        self.psi_p0 = self.psi_p / self.wf_norm(self.psi_p, self.dp)
 
         # Variables which hold steps in evolution
         self.x_evolve_half = None
         self.x_evolve = None
-        self.k_evolve = None
+        self.p_evolve = None
 
     def _set_psi_x(self, psi_x):
         assert psi_x.shape == self.x.shape
-        self.psi_mod_x = (psi_x * np.exp(-1j * self.k[0] * self.x)
+        self.psi_mod_x = (psi_x * np.exp(-1j * self.p[0] * self.x)
                           * self.dx / np.sqrt(2 * np.pi))
-        self.psi_mod_x /= self.norm
-        self.compute_k_from_x()
+        self.psi_mod_x /= self.wf_norm(self.psi_mod_x, self.dx)
+        self.compute_p_from_x()
 
     def _get_psi_x(self):
-        return (self.psi_mod_x * np.exp(1j * self.k[0] * self.x)
-                * np.sqrt(2 * np.pi) / self.dx)
+        to_be_result = (self.psi_mod_x * np.exp(1j * self.p[0] * self.x) * np.sqrt(2 * np.pi) / self.dx)
+        # to_be_result /= self.wf_norm(to_be_result, self.dx)
+        # to_be_result[self.x > self.xmax * 0.98] = 0.
+        # to_be_result[self.x < self.xmin * 0.98] = 0.
+        return to_be_result
 
-    def _set_psi_k(self, psi_k):
-        assert psi_k.shape == self.x.shape
-        self.psi_mod_k = psi_k * np.exp(1j * self.x[0] * self.dk
+    def _set_psi_p(self, psi_p):
+        assert psi_p.shape == self.x.shape
+        self.psi_mod_p = psi_p * np.exp(1j * self.x[0] * self.dp
                                         * np.arange(self.N))
-        self.compute_x_from_k()
-        self.compute_k_from_x()
+        self.compute_x_from_p()
+        self.compute_p_from_x()
 
-    def _get_psi_k(self):
-        return self.psi_mod_k * np.exp(-1j * self.x[0] * self.dk
-                                        * np.arange(self.N))
+    def _get_psi_p(self):
+        return self.psi_mod_p * np.exp(-1j * self.x[0] * self.dp
+                                       * np.arange(self.N))
 
     def _get_dt(self):
         return self.dt_
@@ -109,36 +123,32 @@ class Schrodinger(object):
         if dt != self.dt_:
             self.dt_ = dt
             self.x_evolve_half = np.exp(-0.5 * 1j * self.V_x
-                                         / self.hbar * self.dt)
+                                        / self.hbar * self.dt)
             self.x_evolve = self.x_evolve_half * self.x_evolve_half
-            self.k_evolve = np.exp(-0.5 * 1j * self.hbar / self.m
-                                    * (self.k * self.k) * self.dt)
-
-    def _get_norm(self):
-        return self.wf_norm(self.psi_mod_x)
+            self.p_evolve = np.exp(-0.5 * 1j * self.hbar / self.m
+                                   * (self.p * self.p) * self.dt)
 
     psi_x = property(_get_psi_x, _set_psi_x)
-    psi_k = property(_get_psi_k, _set_psi_k)
-    norm = property(_get_norm)
+    psi_p = property(_get_psi_p, _set_psi_p)
     dt = property(_get_dt, _set_dt)
 
-    def compute_k_from_x(self):
-        self.psi_mod_k = fftpack.fft(self.psi_mod_x)
+    def compute_p_from_x(self):
+        self.psi_mod_p = fftpack.fft(self.psi_mod_x)
 
-    def compute_x_from_k(self):
-        self.psi_mod_x = fftpack.ifft(self.psi_mod_k)
+    def compute_x_from_p(self):
+        self.psi_mod_x = fftpack.ifft(self.psi_mod_p)
 
-    def wf_norm(self, wave_fn):
+    def wf_norm(self, wave_fn, dvalue):
         """
         Returns the norm of a wave function.
 
         Parameters
         ----------
-        wave_fn : array
+        wave_fn : ndarray
             Length-N array of the wavefunction in the position representation
         """
         assert wave_fn.shape == self.x.shape
-        return np.sqrt((abs(wave_fn) ** 2).sum() * 2 * np.pi / self.dx)
+        return np.sqrt((abs(wave_fn) ** 2).sum() * 2 * np.pi / dvalue)
 
     def solve(self, dt, Nsteps=1, eps=1e-3, max_iter=1000):
         """
@@ -165,7 +175,7 @@ class Schrodinger(object):
         while (d_psi > eps) and (num_iter <= max_iter):
             num_iter += 1
             self.time_step(-1j * dt, Nsteps)
-            d_psi = self.wf_norm(self.psi_x - old_psi)
+            d_psi = self.wf_norm(self.psi_x - old_psi, self.dx)
             old_psi = 1. * self.psi_x
         self.t = t0
 
@@ -176,7 +186,7 @@ class Schrodinger(object):
 
         Parameters
         ----------
-        dt : float
+        dt : complex
             The small time interval over which to integrate
         Nsteps : float, optional
             The number of intervals to compute.  The total change in time at
@@ -187,15 +197,16 @@ class Schrodinger(object):
         if Nsteps > 0:
             self.psi_mod_x *= self.x_evolve_half
             for num_iter in xrange(Nsteps - 1):
-                self.compute_k_from_x()
-                self.psi_mod_k *= self.k_evolve
-                self.compute_x_from_k()
+                self.compute_p_from_x()
+                self.psi_mod_p *= self.p_evolve
+                self.compute_x_from_p()
                 self.psi_mod_x *= self.x_evolve
-            self.compute_k_from_x()
-            self.psi_mod_k *= self.k_evolve
-            self.compute_x_from_k()
+            self.compute_p_from_x()
+            self.psi_mod_p *= self.p_evolve
+            self.compute_x_from_p()
             self.psi_mod_x *= self.x_evolve_half
-            self.compute_k_from_x()
-            self.psi_mod_x /= self.norm
-            self.compute_k_from_x()
+            self.compute_p_from_x()
+            self.psi_mod_x /= self.wf_norm(self.psi_mod_x, self.dx)
+            self.compute_p_from_x()
+            # self.psi_mod_p /= self.wf_norm(self.psi_mod_p, self.dp)
             self.t += dt * Nsteps
